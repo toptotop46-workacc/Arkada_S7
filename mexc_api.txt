@@ -1,0 +1,2 @@
+apiKey=ключ
+secretKey=секрет

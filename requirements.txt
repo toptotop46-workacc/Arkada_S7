@@ -1,0 +1,5 @@
+playwright>=1.56.0
+requests>=2.32.0
+loguru>=0.7.2
+web3>=6.0.0
+eth-abi>=4.0.0
