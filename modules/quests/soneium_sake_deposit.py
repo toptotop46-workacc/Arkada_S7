@@ -69,6 +69,8 @@ LI_FI_QUOTE_RETRY_DELAY = 8  # секунд между попытками
 # Резерв на газ для первого свапа ETH→aSuperUSD: не отправляем в LI.FI больше (balance - reserve)
 LI_FI_ETH_SWAP_GAS_LIMIT = 500_000  # ожидаемый gas для LI.FI tx
 LI_FI_ETH_SWAP_GAS_RESERVE_MULTIPLIER = 1.5  # запас на рост gas price
+# Суммарный gas для шагов 2–10 (approve×4, supply, borrow, repay, withdraw, LI.FI×2)
+SUBSEQUENT_STEPS_GAS = 3_500_000
 
 CAMPAIGN_URLS = [
     "https://app.arkada.gg/en/campaign/soneium-score-seventh-sake-deposit",
@@ -262,6 +264,21 @@ def _execute_lifi_tx(private_key: str, transaction_request: dict) -> Optional[st
                         max_fee, max_priority = gas_price, gas_price // 10
                     except Exception:
                         max_fee, max_priority = None, None
+                    effective_gas_price = max_fee if max_fee is not None else w3.eth.gas_price
+                    actual_gas_cost = gas_int * effective_gas_price
+                    balance_now = w3.eth.get_balance(wallet)
+                    if balance_now < value + actual_gas_cost + 1_000_000_000:
+                        max_value_now = balance_now - actual_gas_cost - 1_000_000_000
+                        if max_value_now <= 0:
+                            logger.warning(
+                                "Недостаточно ETH для газа: balance {} wei, gas cost {} wei",
+                                balance_now,
+                                actual_gas_cost,
+                            )
+                            raise ValueError("insufficient funds for gas")
+                        if value > 0:
+                            logger.debug("LI.FI tx value уменьшен с {} до {} wei (резерв на газ)", value, max_value_now)
+                            value = max_value_now
                     tx_params: dict[str, Any] = {"chainId": CHAIN_ID, "from": wallet, "nonce": nonce, "to": to, "data": data, "value": value, "gas": gas_int}
                     if max_fee is not None:
                         tx_params["maxFeePerGas"] = max_fee
@@ -328,16 +345,21 @@ def _get_balance_eth_wei(address: str) -> int:
     return w3.eth.get_balance(Web3.to_checksum_address(address))
 
 
-def _get_gas_reserve_wei_for_lifi_swap() -> int:
-    """Ориентировочный резерв wei на газ для одной LI.FI tx (gas_limit * gas_price * multiplier)."""
+# Fallback gas price для Soneium когда RPC недоступен (0.05 gwei — реалистичный консервативный запас)
+_SONEIUM_FALLBACK_GAS_PRICE = 50_000_000
+
+
+def _get_gas_reserve_wei_for_lifi_swap(gas_limit: int = 0) -> int:
+    """Резерв wei на газ для LI.FI tx. gas_limit=0 — используется LI_FI_ETH_SWAP_GAS_LIMIT."""
+    effective_limit = gas_limit if gas_limit > 0 else LI_FI_ETH_SWAP_GAS_LIMIT
     w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 15}))
     if not w3.is_connected():
-        return int(Web3.to_wei(0.0005, "ether"))  # fallback ~0.0005 ETH
+        return int(effective_limit * _SONEIUM_FALLBACK_GAS_PRICE * LI_FI_ETH_SWAP_GAS_RESERVE_MULTIPLIER)
     try:
         gas_price = w3.eth.gas_price
     except Exception:
-        return int(Web3.to_wei(0.0005, "ether"))
-    return int(LI_FI_ETH_SWAP_GAS_LIMIT * gas_price * LI_FI_ETH_SWAP_GAS_RESERVE_MULTIPLIER)
+        return int(effective_limit * _SONEIUM_FALLBACK_GAS_PRICE * LI_FI_ETH_SWAP_GAS_RESERVE_MULTIPLIER)
+    return int(effective_limit * gas_price * LI_FI_ETH_SWAP_GAS_RESERVE_MULTIPLIER)
 
 
 def _get_token_balance(token: str, address: str) -> int:
@@ -490,31 +512,49 @@ def _do_onchain_steps(private_key: str, wallet_address: str) -> bool:
     Выполняет шаги 1–10. Паузы: 10–30 с между шагами, кроме короткой (1–3 с) после апрувов и между LI.FI-свапами.
     Возвращает True при полном успехе.
     """
-    # 1) Свап ETH → aSuperUSD (0.01131–0.012 ETH); сумма не больше (balance − резерв на газ)
+    # 1) Свап ETH → aSuperUSD (0.01131–0.012 ETH)
+    # Сначала получаем предварительную котировку — чтобы узнать реальный gasLimit от LI.FI,
+    # затем вычисляем безопасный amount и при нужде перезапрашиваем котировку.
     amount_eth = random.uniform(SWAP_ETH_MIN, SWAP_ETH_MAX)
     amount_wei = int(Web3.to_wei(amount_eth, "ether"))
     balance_wei = _get_balance_eth_wei(wallet_address)
-    gas_reserve_wei = _get_gas_reserve_wei_for_lifi_swap()
-    amount_wei_capped = min(amount_wei, max(0, balance_wei - gas_reserve_wei))
     min_swap_wei = int(Web3.to_wei(SWAP_ETH_MIN, "ether"))
-    if amount_wei_capped < min_swap_wei:
-        logger.warning(
-            "Недостаточно ETH для первого свапа с резервом на газ: баланс {} wei, резерв {} wei, нужно не менее {} wei",
-            balance_wei,
-            gas_reserve_wei,
-            min_swap_wei,
-        )
-        return False
-    if amount_wei_capped < amount_wei:
-        logger.info(
-            "Сумма первого свапа ограничена резервом на газ: {} wei (было {} wei)",
-            amount_wei_capped,
-            amount_wei,
-        )
-    quote = _get_lifi_quote(NATIVE_ETH, A_SUPER_USD, amount_wei_capped, wallet_address)
+
+    quote = _get_lifi_quote(NATIVE_ETH, A_SUPER_USD, amount_wei, wallet_address)
     if not quote:
         logger.warning("LI.FI котировка ETH→aSuperUSD недоступна")
         return False
+
+    # Реальный gasLimit из ответа LI.FI
+    tx_req_prelim = quote["_transaction_request"]
+    gas_limit_raw = tx_req_prelim.get("gasLimit") or tx_req_prelim.get("gas")
+    if isinstance(gas_limit_raw, str):
+        gas_int_real = int(gas_limit_raw, 16) if gas_limit_raw.startswith("0x") else int(gas_limit_raw)
+    else:
+        gas_int_real = int(gas_limit_raw or 0)
+    gas_int_real = max(gas_int_real, LI_FI_ETH_SWAP_GAS_LIMIT)  # не ниже нашего floor
+
+    # Резервируем газ для шага 1 (реальный gasLimit) + все последующие шаги (2–10)
+    gas_reserve_wei = _get_gas_reserve_wei_for_lifi_swap(gas_limit=gas_int_real + SUBSEQUENT_STEPS_GAS)
+    safe_amount_wei = max(0, balance_wei - gas_reserve_wei)
+
+    if safe_amount_wei < min_swap_wei:
+        logger.warning(
+            "Недостаточно ETH для свапа (реальный газ): баланс {} wei, резерв {} wei, нужно не менее {} wei",
+            balance_wei, gas_reserve_wei, min_swap_wei,
+        )
+        return False
+
+    if safe_amount_wei < amount_wei:
+        logger.info(
+            "Сумма свапа скорректирована под реальный газ: {} wei → {} wei",
+            amount_wei, safe_amount_wei,
+        )
+        quote = _get_lifi_quote(NATIVE_ETH, A_SUPER_USD, safe_amount_wei, wallet_address)
+        if not quote:
+            logger.warning("LI.FI котировка ETH→aSuperUSD (скорр.) недоступна")
+            return False
+
     if _execute_lifi_tx(private_key, quote["_transaction_request"]) is None:
         return False
     pause = random.uniform(PAUSE_MIN, PAUSE_MAX)
@@ -583,7 +623,7 @@ def _do_onchain_steps(private_key: str, wallet_address: str) -> bool:
     logger.info("Пауза {:.0f} с", pause)
     time.sleep(pause)
 
-    # 9) Свап весь aSuperUSD → USDC.e (перед LI.FI нужен approve токена на роутер)
+    # 9) Свап весь aSuperUSD → USDC.e (best-effort: сбой не блокирует Verify/Claim)
     balance_asuper2 = _get_token_balance(A_SUPER_USD, wallet_address)
     if balance_asuper2 > 0:
         quote9 = _get_lifi_quote(A_SUPER_USD, USDCE, balance_asuper2, wallet_address)
@@ -594,37 +634,44 @@ def _do_onchain_steps(private_key: str, wallet_address: str) -> bool:
             if not approval_addr and quote9.get("includedSteps"):
                 est9 = quote9["includedSteps"][0].get("estimate") or {}
                 approval_addr = est9.get("approvalAddress")
+            approve9_ok = True
             if approval_addr:
                 if _approve(private_key, A_SUPER_USD, approval_addr, balance_asuper2) is None:
-                    logger.warning("Approve aSuperUSD для LI.FI не выполнен")
+                    logger.warning("Approve aSuperUSD для LI.FI не выполнен — свап пропущен")
+                    approve9_ok = False
                 else:
                     time.sleep(random.uniform(PAUSE_SHORT_MIN, PAUSE_SHORT_MAX))
-            if _execute_lifi_tx(private_key, req9):
-                time.sleep(random.uniform(PAUSE_SHORT_MIN, PAUSE_SHORT_MAX))
-            else:
-                logger.warning("Свап aSuperUSD→USDC.e не выполнен")
+            if approve9_ok:
+                if _execute_lifi_tx(private_key, req9):
+                    time.sleep(random.uniform(PAUSE_SHORT_MIN, PAUSE_SHORT_MAX))
+                else:
+                    logger.warning("Свап aSuperUSD→USDC.e не выполнен")
+        else:
+            logger.warning("LI.FI котировка aSuperUSD→USDC.e недоступна")
 
-    # 10) Свап весь USDC.e → ETH (перед LI.FI нужен approve USDC.e на роутер)
+    # 10) Свап весь USDC.e → ETH (best-effort: основной квест уже выполнен на шагах 4–8)
     balance_usdce3 = _get_token_balance(USDCE, wallet_address)
     if balance_usdce3 > 0:
         quote10 = _get_lifi_quote(USDCE, NATIVE_ETH, balance_usdce3, wallet_address)
         if not quote10:
-            logger.warning("LI.FI котировка USDC.e→ETH недоступна")
-            return False
-        req10 = quote10["_transaction_request"]
-        est10 = quote10.get("estimate") or {}
-        approval_addr10 = est10.get("approvalAddress")
-        if not approval_addr10 and quote10.get("includedSteps"):
-            est10 = quote10["includedSteps"][0].get("estimate") or {}
+            logger.warning("LI.FI котировка USDC.e→ETH недоступна — шаг пропущен")
+        else:
+            req10 = quote10["_transaction_request"]
+            est10 = quote10.get("estimate") or {}
             approval_addr10 = est10.get("approvalAddress")
-        if approval_addr10:
-            if _approve(private_key, USDCE, approval_addr10, balance_usdce3) is None:
-                logger.warning("Approve USDC.e для LI.FI не выполнен")
-            else:
-                time.sleep(random.uniform(PAUSE_SHORT_MIN, PAUSE_SHORT_MAX))
-        if _execute_lifi_tx(private_key, req10) is None:
-            logger.warning("Свап USDC.e→ETH не выполнен")
-            return False
+            if not approval_addr10 and quote10.get("includedSteps"):
+                est10 = quote10["includedSteps"][0].get("estimate") or {}
+                approval_addr10 = est10.get("approvalAddress")
+            approve10_ok = True
+            if approval_addr10:
+                if _approve(private_key, USDCE, approval_addr10, balance_usdce3) is None:
+                    logger.warning("Approve USDC.e для LI.FI не выполнен — свап пропущен")
+                    approve10_ok = False
+                else:
+                    time.sleep(random.uniform(PAUSE_SHORT_MIN, PAUSE_SHORT_MAX))
+            if approve10_ok:
+                if _execute_lifi_tx(private_key, req10) is None:
+                    logger.warning("Свап USDC.e→ETH не выполнен")
     return True
 
 

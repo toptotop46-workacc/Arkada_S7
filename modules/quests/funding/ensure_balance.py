@@ -111,6 +111,15 @@ def _wait_for_balance(
     return False
 
 
+_BRIDGE_RETRIES = 3        # всего попыток (1 оригинальная + 2 повтора со свежей котировкой)
+_BRIDGE_RETRY_DELAY = 15  # секунд между попытками
+_GAS_RESERVE_PER_BRIDGE = 0.0001  # резерв ETH на газ в исходной L2-сети
+_MIN_BRIDGE_ETH = 0.001           # меньше этого бриджить не стоит (газ дороже выгоды)
+
+
+_L2_GAS_MARGIN_WEI = int(0.0001 * 1e18)  # 0.0001 ETH запас на газ в исходной L2-сети
+
+
 def _try_bridge_from_l2(
     private_key: str,
     from_chain_id: int,
@@ -118,23 +127,75 @@ def _try_bridge_from_l2(
     from_address: str,
     amount_eth: float,
 ) -> bool:
-    """Бриджим amount_eth из from_chain_id в Soneium. Возвращает True при успехе."""
+    """Бриджим amount_eth из from_chain_id в Soneium. При реверте контракта повторяет
+    со свежей котировкой (до _BRIDGE_RETRIES попыток). Возвращает True при успехе."""
     amount_wei = int(amount_eth * 1e18)
     to_chain = get_soneium_chain_id()
-    quote = lifi.get_bridge_quote(from_chain_id, to_chain, amount_wei, from_address, from_address)
-    if not quote:
-        logger.warning("LI.FI не дал квоту {} -> Soneium для {} ETH", chain_name, amount_eth)
-        return False
-    # Баланс в Soneium до бриджа — читаем до execute_bridge, иначе prev может уже включать приход средств
+    # Читаем баланс Soneium один раз до любых попыток —
+    # при реверте первой tx средства не поступали, prev остаётся валидным.
     prev = bal.get_eth_balance(to_chain, from_address)
-    tx = lifi.execute_bridge(private_key, quote, from_chain_id)
-    if not tx:
-        return False
+    tx = None
+    amount_adjusted = False  # пересчитать fromAmount под реальный tx.value можно только один раз
+    for attempt in range(1, _BRIDGE_RETRIES + 1):
+        quote = lifi.get_bridge_quote(from_chain_id, to_chain, amount_wei, from_address, from_address)
+        if not quote:
+            logger.warning(
+                "LI.FI не дал квоту {} -> Soneium для {} wei (попытка {}/{})",
+                chain_name, amount_wei, attempt, _BRIDGE_RETRIES,
+            )
+            if attempt < _BRIDGE_RETRIES:
+                time.sleep(_BRIDGE_RETRY_DELAY)
+                continue
+            return False
+
+        # transactionRequest.value от LI.FI включает fromAmount + протокольные комиссии (~3-5%).
+        # Если реальный tx.value превышает доступный баланс L2, пересчитываем fromAmount.
+        req = quote.get("transactionRequest") or {}
+        raw_val = req.get("value", 0)
+        tx_value_wei = int(raw_val, 16) if isinstance(raw_val, str) and raw_val.startswith("0x") else int(raw_val or 0)
+        l2_balance_wei = int(bal.get_eth_balance(from_chain_id, from_address) * 1e18)
+        if tx_value_wei + _L2_GAS_MARGIN_WEI > l2_balance_wei and not amount_adjusted:
+            available = l2_balance_wei - _L2_GAS_MARGIN_WEI
+            if available <= 0 or amount_wei == 0:
+                logger.warning(
+                    "Недостаточно баланса {} для бриджа: нужно {} wei + газ, есть {} wei",
+                    chain_name, tx_value_wei, l2_balance_wei,
+                )
+                return False
+            # fee_ratio = tx_value / fromAmount (≈ 1.03–1.05 — LI.FI комиссии)
+            fee_ratio = tx_value_wei / amount_wei
+            new_amount_wei = int(available / max(fee_ratio, 1.0))
+            if new_amount_wei < int(_MIN_BRIDGE_ETH * 1e18):
+                logger.warning(
+                    "После учёта комиссий LI.FI сумма бриджа {} слишком мала: {} wei",
+                    chain_name, new_amount_wei,
+                )
+                return False
+            logger.info(
+                "Сумма бриджа {} скорректирована под реальный tx.value: {} → {} wei",
+                chain_name, amount_wei, new_amount_wei,
+            )
+            amount_wei = new_amount_wei
+            amount_adjusted = True
+            continue  # перезапрашиваем котировку с новой суммой (попытка не расходуется)
+
+        tx = lifi.execute_bridge(private_key, quote, from_chain_id)
+        if tx:
+            break
+        if attempt < _BRIDGE_RETRIES:
+            logger.warning(
+                "Бридж {} -> Soneium не выполнен (попытка {}/{}), повтор со свежей котировкой через {} с",
+                chain_name, attempt, _BRIDGE_RETRIES, _BRIDGE_RETRY_DELAY,
+            )
+            time.sleep(_BRIDGE_RETRY_DELAY)
+        else:
+            logger.warning("Бридж {} -> Soneium не выполнен после {} попыток", chain_name, _BRIDGE_RETRIES)
+            return False
     time.sleep(5)
     return _wait_for_balance(
         to_chain,
         from_address,
-        prev + amount_eth * 0.95,
+        prev + (amount_wei / 1e18) * 0.95,
         WAIT_AFTER_BRIDGE_TIMEOUT,
         WAIT_AFTER_BRIDGE_POLL_INTERVAL,
         "Soneium после бриджа",
@@ -172,31 +233,54 @@ def ensure_soneium_balance(
         round(required_eth, 6),
     )
 
-    # Проверяем балансы в L2
+    # Бриджим из L2: от каждой сети — min(доступно, оставшаяся нехватка).
+    # Сортируем по убыванию баланса — сначала самая «богатая» сеть.
     l2 = bal.get_l2_balances(wallet_address)
-    for chain_id, name, balance_eth in l2:
-        if balance_eth >= required_eth_with_slippage + 0.0005:
-            logger.info("Достаточно в {}: {} ETH — бриджим", name, round(balance_eth, 6))
-            if _try_bridge_from_l2(private_key, chain_id, name, wallet_address, required_eth_with_slippage):
-                return True
-            logger.warning("Бридж из {} не удался, пробуем следующую сеть", name)
 
-    # Не хватает в L2 — вывод с MEXC
+    for chain_id, name, balance_eth in sorted(l2, key=lambda x: -x[2]):
+        current_usd = bal.get_soneium_balance_usd(wallet_address, eth_price)
+        if current_usd >= MIN_BALANCE_USD:
+            return True
+        shortfall_now = max(0.0, target_usd - current_usd)
+        needed_now = (shortfall_now / eth_price) * SLIPPAGE_FACTOR
+        amount = min(balance_eth - _GAS_RESERVE_PER_BRIDGE, needed_now)
+        if amount < _MIN_BRIDGE_ETH:
+            continue
+        logger.info(
+            "Бридж из {}: {:.6f} ETH (доступно {:.6f} ETH, нужно {:.6f} ETH)",
+            name, amount, balance_eth, needed_now,
+        )
+        _try_bridge_from_l2(private_key, chain_id, name, wallet_address, amount)
+
+    # Пересчитываем нехватку после всех L2-бриджей
+    current_usd = bal.get_soneium_balance_usd(wallet_address, eth_price)
+    if current_usd >= MIN_BALANCE_USD:
+        return True
+
+    shortfall_after_l2 = max(0.0, target_usd - current_usd)
+    mexc_eth_needed = (shortfall_after_l2 / eth_price) * SLIPPAGE_FACTOR
+    logger.info(
+        "После L2-бриджей не хватает ~{:.2f}$ (~{:.6f} ETH) — вывод с MEXC",
+        shortfall_after_l2, mexc_eth_needed,
+    )
+
+    # Вывод с MEXC только на остаток
     networks = mexc.get_eth_withdraw_networks()
     if not networks:
         logger.warning("MEXC: нет доступных сетей для вывода ETH или нет ключей в mexc_api.txt")
         return False
 
-    # Выбираем сеть: withdrawMin <= required_eth и (required + fee) <= withdrawMax.
+    # Сумма вывода: max(нужно, withdrawMin) — на случай если остаток меньше минимума MEXC.
+    # Небольшой излишек в Soneium не страшен.
     suitable = [
         n for n in networks
-        if n.get("withdrawMin", 999) <= required_eth_with_slippage
-        and (required_eth_with_slippage + float(n.get("withdrawFee") or 0)) <= n.get("withdrawMax", float("inf"))
+        if (max(mexc_eth_needed, float(n.get("withdrawMin") or 0)) + float(n.get("withdrawFee") or 0))
+        <= n.get("withdrawMax", float("inf"))
     ]
     if not suitable:
         logger.warning(
-            "MEXC: нет сети, где {} ETH укладывается в лимиты (withdrawMin/withdrawMax)",
-            round(required_eth_with_slippage, 6),
+            "MEXC: нет сети, где {:.6f} ETH укладывается в лимиты (withdrawMin/withdrawMax)",
+            mexc_eth_needed,
         )
         return False
 
@@ -206,8 +290,9 @@ def ensure_soneium_balance(
     for candidate in suitable:
         net_work = candidate.get("netWork") or candidate.get("network") or ""
         fee = float(candidate.get("withdrawFee") or 0)
-        amount_to_withdraw = required_eth_with_slippage + fee
-        logger.info("Вывод с MEXC: {} ETH в сеть {}", round(amount_to_withdraw, 6), net_work)
+        min_w = float(candidate.get("withdrawMin") or 0)
+        amount_to_withdraw = max(mexc_eth_needed, min_w) + fee
+        logger.info("Вывод с MEXC: {:.6f} ETH в сеть {}", amount_to_withdraw, net_work)
         withdraw_id = mexc.withdraw("ETH", wallet_address, amount_to_withdraw, net_work)
         if withdraw_id:
             net = candidate
@@ -218,7 +303,8 @@ def ensure_soneium_balance(
         return False
     net_work = net.get("netWork") or net.get("network") or ""
     fee = float(net.get("withdrawFee") or 0)
-    amount_to_withdraw = required_eth_with_slippage + fee
+    min_w = float(net.get("withdrawMin") or 0)
+    amount_to_withdraw = max(mexc_eth_needed, min_w) + fee
     logger.info("MEXC вывод создан: {}", withdraw_id)
 
     chain_id = MEXC_NETWORK_TO_CHAIN.get(net_work.upper()) or next(

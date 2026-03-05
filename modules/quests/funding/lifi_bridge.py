@@ -122,24 +122,19 @@ def execute_bridge(
             gas_limit = req.get("gasLimit") or req.get("gas")
             gas_int = int(gas_limit, 16) if isinstance(gas_limit, str) else (int(gas_limit or 0) * 2 or 500000)
             try:
-                base_fee = w3.eth.get_block("latest").get("baseFeePerGas") or 0
-                gas_price_for_reserve = (base_fee * 2 + (base_fee // 10)) if base_fee else w3.eth.gas_price
-            except Exception:
                 gas_price_for_reserve = w3.eth.gas_price
+            except Exception:
+                gas_price_for_reserve = 1_000_000_000  # 1 gwei fallback
             gas_cost = gas_int * gas_price_for_reserve
-            gas_reserve = int(gas_cost * 2)  # запас 100% на рост base_fee к моменту отправки
+            gas_reserve = int(gas_cost * 1.5)  # запас 50% на рост gas_price к моменту отправки
             balance = w3.eth.get_balance(account.address)
             if balance < value + gas_reserve:
-                max_value = balance - gas_reserve
-                if max_value <= 0:
-                    logger.warning(
-                        "Недостаточно средств для бриджа (баланс меньше комиссии): have {} wei, reserve {} wei",
-                        balance,
-                        gas_reserve,
-                    )
-                    return None
-                value = min(value, max_value)
-                logger.debug("value уменьшен до {} wei (резерв под газ)", value)
+                logger.warning(
+                    "Недостаточно ETH для бриджа: баланс {} wei < value {} + резерв {} wei"
+                    " — запросите котировку с меньшей суммой",
+                    balance, value, gas_reserve,
+                )
+                return None
             tx_hash = None
             for nonce_attempt in range(3):
                 try:
@@ -158,16 +153,12 @@ def execute_bridge(
                     actual_gas_cost = gas_int * gas_price
                     # Резерв 1e9 wei на округление и мелкие колебания
                     if balance_now < value + actual_gas_cost + 1_000_000_000:
-                        max_value_now = balance_now - actual_gas_cost - 1_000_000_000
-                        if max_value_now <= 0:
-                            logger.warning(
-                                "Недостаточно средств для газа при отправке: balance {} wei, gas cost {} wei",
-                                balance_now,
-                                actual_gas_cost,
-                            )
-                            raise ValueError("insufficient funds for gas")
-                        value = min(value, max_value_now)
-                        logger.debug("value уменьшен перед отправкой до {} wei", value)
+                        logger.warning(
+                            "Недостаточно ETH при отправке бриджа: balance {} wei,"
+                            " value {} + gas {} wei — нужна котировка с меньшей суммой",
+                            balance_now, value, actual_gas_cost,
+                        )
+                        raise ValueError("insufficient funds for gas")
                     # Используем уже посчитанные base_fee и gas_price — так сумма value+gas не превысит баланс
                     if base_fee:
                         tx_params = {
